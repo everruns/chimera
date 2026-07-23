@@ -15,5 +15,10 @@ path = "main.rs"
 [dependencies]
 chimera-runtime = { path = "../runtime" }
 argh = "0.1.19"
-mimalloc = "0.1.52"
 shlex = "1.3.0"
+
+# mimalloc keeps Chimera's heap off the program break, which the guest libc
+# shares on Linux; on Windows there is no brk to collide over, so the system
+# allocator serves and the C dependency is dropped.
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = "0.1.52"

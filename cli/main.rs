@@ -6,20 +6,25 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
 };
 
-use chimera::{HostFs, MountFlags, Namespace, Personality, Sandbox};
-use mimalloc::MiMalloc;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
+use chimera::Sandbox;
+#[cfg(target_os = "linux")]
+use chimera::{HostFs, MountFlags, Namespace, Personality};
 
 use opts::{Command, Opts, RunCmd};
 
 /// Route every Chimera-side allocation through mimalloc, whose segments are
 /// `mmap`-backed and never touch `brk`. This keeps Chimera's heap clear of the
 /// guest libc's `brk`-managed `main_arena`, which shares the one process-wide
-/// program break.
+/// program break. Windows has no such collision (see the CLI manifest), so it
+/// keeps the system allocator.
+#[cfg(target_os = "linux")]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let opts: Opts = argh::from_env();
@@ -29,10 +34,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// The host triple the front end reports, for the `version` subcommand.
+#[cfg(target_os = "linux")]
+const HOST: &str = "linux x86-64";
+#[cfg(windows)]
+const HOST: &str = "windows x86-64";
+
 fn version() -> ExitCode {
     println!(
-        "chimera version {} linux x86-64 {}",
+        "chimera version {} {} {}",
         env!("CARGO_PKG_VERSION"),
+        HOST,
         if chimera::mpk_enabled() {
             "mpk"
         } else {
@@ -61,20 +73,8 @@ fn run(cmd: RunCmd) -> ExitCode {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
 
-    // Route the guest's filesystem syscalls through a userspace VFS: a host
-    // passthrough mounted at `/`, so the guest sees the real tree but every
-    // operation crosses the Vfs seam. The mount is read-only by default — the
-    // guest can read the host but not change it — and `--unsafe` opts into
-    // read-write. The root must exist, so this construction cannot fail.
-    let flags = if cmd.unsafe_ {
-        MountFlags::NONE
-    } else {
-        MountFlags::RDONLY
-    };
-    let root = HostFs::new("/").expect("host root / is a directory");
-    let personality = Personality::new(Namespace::with_root(Arc::new(root), flags));
-    personality.set_exe(&program.exec);
-    sandbox.system_calls(personality);
+    #[cfg(target_os = "linux")]
+    install_vfs(&mut sandbox, &program, cmd.unsafe_);
 
     match sandbox.args(&program.args).run() {
         Ok(status) => ExitCode::from(status.code() as u8),
@@ -83,6 +83,26 @@ fn run(cmd: RunCmd) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Route the guest's filesystem syscalls through a userspace VFS: a host
+/// passthrough mounted at `/`, so the guest sees the real tree but every
+/// operation crosses the `Vfs` seam. The mount is read-only by default — the
+/// guest can read the host but not change it — and `--unsafe` opts into
+/// read-write. The root must exist, so this construction cannot fail. The
+/// Windows guest has no VFS layer yet, so its front end runs the default
+/// (interception) handler.
+#[cfg(target_os = "linux")]
+fn install_vfs(sandbox: &mut Sandbox, program: &Program, unsafe_: bool) {
+    let flags = if unsafe_ {
+        MountFlags::NONE
+    } else {
+        MountFlags::RDONLY
+    };
+    let root = HostFs::new("/").expect("host root / is a directory");
+    let personality = Personality::new(Namespace::with_root(Arc::new(root), flags));
+    personality.set_exe(&program.exec);
+    sandbox.system_calls(personality);
 }
 
 struct Program {

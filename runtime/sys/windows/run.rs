@@ -78,8 +78,8 @@ impl Guest {
         // Own the vectored exception handler (guarded-copy fixups and
         // self-modifying-code write traps) and publish this guest's address
         // space so the handler can reach it.
-        super::fault::install();
-        super::fault::set_address_space(&self.addr);
+        crate::sys::fault::install();
+        crate::sys::fault::set_address_space(&self.addr);
 
         // Bind the context segment to this thread's ThreadState, and record the
         // runtime's own gs (TEB) base so the exit trampoline can restore it
