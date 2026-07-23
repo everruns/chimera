@@ -75,6 +75,12 @@ impl Guest {
 
     /// Run the guest to termination, returning its exit status.
     pub fn run(&mut self) -> Result<i32, Error> {
+        // Own the vectored exception handler (guarded-copy fixups and
+        // self-modifying-code write traps) and publish this guest's address
+        // space so the handler can reach it.
+        super::fault::install();
+        super::fault::set_address_space(&self.addr);
+
         // Bind the context segment to this thread's ThreadState, and record the
         // runtime's own gs (TEB) base so the exit trampoline can restore it
         // after a block that installed the guest's gs.
@@ -292,6 +298,38 @@ mod tests {
             0xC3, // ret
         ];
         assert_eq!(run_code(&code).0, 3);
+    }
+
+    #[test]
+    fn indirect_call_and_return() {
+        // lea rax,[rip+3] ; call rax ; ret ; func: mov eax,88 ; ret
+        // Exercises the inline indirect-branch table on both the call and the two
+        // returns.
+        let code = [
+            0x48, 0x8D, 0x05, 0x03, 0x00, 0x00, 0x00, // lea rax, [rip+3] -> func
+            0xFF, 0xD0, // call rax
+            0xC3, // ret  (returns to null -> exit with rax)
+            0xB8, 0x58, 0x00, 0x00, 0x00, // func: mov eax, 88
+            0xC3, // ret
+        ];
+        assert_eq!(run_code(&code).0, 88);
+    }
+
+    #[test]
+    fn self_modifying_code_reexecutes() {
+        // Block A stores 5 over the immediate of a `mov eax, 0` that lives in a
+        // second block B, then jumps to B. The store hits the armed code page and
+        // traps into the vectored handler, which drops the stale translation and
+        // restores write permission; B is then translated fresh from the modified
+        // bytes, so the guest sees `mov eax, 5`.
+        //   mov byte [rip+3], 5 ; jmp B ; B: mov eax, 0 ; ret
+        let code = [
+            0xC6, 0x05, 0x03, 0x00, 0x00, 0x00, 0x05, // mov byte [rip+3], 5  (patches @10)
+            0xEB, 0x00, // jmp +0 -> B (block boundary)
+            0xB8, 0x00, 0x00, 0x00, 0x00, // B: mov eax, 0   (imm@10 -> 5)
+            0xC3, // ret
+        ];
+        assert_eq!(run_code(&code).0, 5);
     }
 
     #[test]

@@ -17,13 +17,41 @@
 //! loop; until then this handler only performs the copy fixups, which need no
 //! per-thread state and are recognized purely by instruction-pointer range.
 
-use std::sync::Once;
+use std::{
+    ptr,
+    sync::{
+        Once,
+        atomic::{AtomicPtr, Ordering},
+    },
+};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS,
 };
 
-use crate::arch::x86::trampoline::{fetch_copy_span, guarded_copy_fixup, in_guarded_copy};
+use crate::{
+    arch::x86::{
+        trampoline::{fetch_copy_span, guarded_copy_fixup, in_guarded_copy},
+        translate::code_cache_contains,
+    },
+    sys::mmap::AddressSpace,
+};
+
+/// The running guest's address space, published by [`set_address_space`] so the
+/// handler can drop stale translations and restore write permission when a guest
+/// store hits an armed self-modifying-code page. A raw pointer because the
+/// handler cannot hold a borrow; the run loop owns the space and outlives every
+/// fault it can take. Single guest per process for now (see the run loop).
+static ADDRESS_SPACE: AtomicPtr<AddressSpace> = AtomicPtr::new(ptr::null_mut());
+
+/// Publish the guest address space for the fault handler, before any guest code
+/// runs.
+pub fn set_address_space(addr: &AddressSpace) {
+    ADDRESS_SPACE.store(
+        addr as *const AddressSpace as *mut AddressSpace,
+        Ordering::Release,
+    );
+}
 
 /// `STATUS_ACCESS_VIOLATION` and `STATUS_IN_PAGE_ERROR` — the exception codes a
 /// bad read or write raises (the second on a file-backed mapping whose backing
@@ -70,6 +98,22 @@ unsafe extern "system" fn chimera_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     if in_guarded_copy(rip) {
         unsafe { (*context).Rip = guarded_copy_fixup() as u64 };
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // A write fault taken while executing translated code (rip in the code
+    // cache) against an armed self-modifying-code page: drop the page's stale
+    // translations and restore its write permission so the store re-runs. The
+    // exception's `ExceptionInformation` carries [access-kind, faulting-address],
+    // and access-kind 1 is a write. Only a store from the cache can be an SMC
+    // write, which also means this thread holds no address-space lock.
+    let info = unsafe { &(*record).ExceptionInformation };
+    let is_write = info[0] == 1;
+    let fault_addr = info[1];
+    if is_write && code_cache_contains(rip) {
+        let space = ADDRESS_SPACE.load(Ordering::Acquire);
+        if !space.is_null() && unsafe { (*space).on_smc_write(fault_addr) } {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     EXCEPTION_CONTINUE_SEARCH
