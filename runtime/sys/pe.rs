@@ -13,7 +13,10 @@
 //! and unit-tests on any host — the module is compiled for a Windows target and
 //! for test builds everywhere.
 
-use crate::{Error, sys::vm::Prot};
+use crate::{
+    Error,
+    sys::vm::{self, Prot},
+};
 
 /// `MZ` — the DOS header magic every PE image still begins with.
 const DOS_MAGIC: u16 = 0x5A4D;
@@ -230,26 +233,114 @@ pub fn apply_relocations(image: &mut [u8], reloc_dir: (u32, u32), delta: i64) ->
     Ok(())
 }
 
+/// A guest PE image mapped into the host address space, ready for the run loop
+/// to translate from and dispatch into. `base` is the load address, `entry` the
+/// absolute entry point, `size` the reservation to release on teardown.
+#[derive(Debug)]
+pub struct MappedImage {
+    pub base: *mut u8,
+    pub entry: u64,
+    pub size: usize,
+}
+
+/// Map a guest PE into the host address space: reserve its virtual size, copy
+/// the headers and each section to its RVA, apply base relocations for the
+/// address it actually landed at, and set each region's protection. The image
+/// is committed read-write for the copy and relocation, then tightened per
+/// section — headers and non-writable sections to read-only, writable sections
+/// left read-write. Returns the mapping, or releases the reservation and fails
+/// on a malformed image.
+pub fn map_pe(file: &[u8]) -> Result<MappedImage, Error> {
+    let pe = parse_pe(file)?;
+    let size = pe.size_of_image as usize;
+    if size == 0 {
+        return Err(bad("image has zero size"));
+    }
+    let base = vm::reserve(size)?;
+
+    // A closure so any failure past this point releases the reservation.
+    let build = || -> Result<(), Error> {
+        vm::commit(base, size, Prot::ReadWrite)?;
+        let image = unsafe { std::slice::from_raw_parts_mut(base, size) };
+
+        let hdr = (pe.size_of_headers as usize).min(size).min(file.len());
+        image[..hdr].copy_from_slice(&file[..hdr]);
+
+        for s in &pe.sections {
+            let va = s.virtual_address as usize;
+            let n = (s.size_of_raw_data as usize).min(s.virtual_size as usize);
+            let raw = s.pointer_to_raw_data as usize;
+            let dst_end = va
+                .checked_add(n)
+                .ok_or_else(|| bad("section overflows image"))?;
+            let src_end = raw
+                .checked_add(n)
+                .ok_or_else(|| bad("section raw data out of range"))?;
+            if dst_end > size || src_end > file.len() {
+                return Err(bad("section out of bounds"));
+            }
+            image[va..dst_end].copy_from_slice(&file[raw..src_end]);
+        }
+
+        let delta = (base as u64).wrapping_sub(pe.image_base) as i64;
+        apply_relocations(image, pe.reloc_dir, delta)?;
+        Ok(())
+    };
+    if let Err(e) = build() {
+        vm::release(base, size);
+        return Err(e);
+    }
+
+    // Tighten protections now that the bytes are in place. Best-effort: a failed
+    // reprotect leaves the region readable-writable, never inaccessible, so the
+    // image stays usable.
+    let hdr_pages = (pe.size_of_headers as usize).min(size);
+    let _ = vm::protect(base, hdr_pages, Prot::Read);
+    for s in &pe.sections {
+        let va = s.virtual_address as usize;
+        if va < size {
+            let len = (s.virtual_size as usize).min(size - va);
+            let _ = vm::protect(unsafe { base.add(va) }, len, s.prot());
+        }
+    }
+
+    Ok(MappedImage {
+        base,
+        entry: base as u64 + pe.entry_rva as u64,
+        size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The RVA of the `.text` marker byte and of the self-referential pointer
+    /// the DIR64 relocation fixes up, both inside `.text`.
+    const MARKER_RVA: usize = 0x1000;
+    const PTR_RVA: usize = 0x1008;
+    /// The `.text` marker byte, an `int3`, so the map test can confirm the
+    /// section's raw bytes were copied to their RVA.
+    const MARKER_BYTE: u8 = 0xCC;
+
     /// Build a minimal but structurally valid PE32+ image: a DOS stub, the PE
     /// signature, a COFF header, a PE32+ optional header with a base-relocation
-    /// directory, and one `.reloc` section carrying a single DIR64 fixup that
-    /// targets a 64-bit pointer parked at RVA 0x2000.
-    fn build_pe(image_base: u64, pointer_value: u64) -> (Vec<u8>, usize) {
+    /// directory, a `.text` section carrying a marker byte and a self-referential
+    /// pointer at [`PTR_RVA`], and a `.reloc` section carrying one DIR64 fixup
+    /// for that pointer. RVAs and file offsets are kept identical so the same
+    /// buffer serves both the file-offset parser and the RVA-indexed relocator.
+    /// The pointer's value is `image_base + PTR_RVA`, so after relocation it
+    /// equals its own mapped address.
+    fn build_pe(image_base: u64) -> Vec<u8> {
+        const IMPORT_SCN_MEM_READ: u32 = 0x4000_0000;
         let pe_off = 0x40usize;
         let opt = pe_off + 4 + 20;
         let size_of_optional = 0xF0usize; // 112 + 16*8
         let sec_base = opt + size_of_optional;
-        let headers_end = sec_base + 40;
+        let headers_end = sec_base + 2 * 40;
 
-        // File image: headers, then the .reloc raw data, then the pointer slot.
-        // Keep RVAs and file offsets identical for simplicity (section alignment
-        // is not exercised by the parser or the relocator).
-        let reloc_rva = 0x1000usize;
-        let ptr_rva = 0x2000usize;
+        let text_rva = 0x1000usize;
+        let reloc_rva = 0x2000usize;
         let mut buf = vec![0u8; 0x3000];
 
         let put16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -263,12 +354,12 @@ mod tests {
         // COFF header.
         let coff = pe_off + 4;
         put16(&mut buf, coff, MACHINE_AMD64);
-        put16(&mut buf, coff + 2, 1); // one section
+        put16(&mut buf, coff + 2, 2); // two sections
         put16(&mut buf, coff + 16, size_of_optional as u16);
 
         // Optional header (PE32+).
         put16(&mut buf, opt, OPT_MAGIC_PE32PLUS);
-        put32(&mut buf, opt + 16, 0x1000); // entry rva
+        put32(&mut buf, opt + 16, text_rva as u32); // entry rva
         put64(&mut buf, opt + 24, image_base);
         put32(&mut buf, opt + 56, 0x3000); // size of image
         put32(&mut buf, opt + 60, headers_end as u32); // size of headers
@@ -276,40 +367,54 @@ mod tests {
         // Directory 5 (base relocations): rva, size.
         let dir5 = opt + 112 + DIR_BASERELOC * 8;
         put32(&mut buf, dir5, reloc_rva as u32);
-        put32(&mut buf, dir5 + 4, 12); // one 8-byte header + one 4-byte body pad
+        put32(&mut buf, dir5 + 4, 12); // one 8-byte header + one entry (padded)
+
+        // Section header for `.text`.
+        buf[sec_base..sec_base + 5].copy_from_slice(b".text");
+        put32(&mut buf, sec_base + 8, 0x1000); // virtual size
+        put32(&mut buf, sec_base + 12, text_rva as u32); // virtual address
+        put32(&mut buf, sec_base + 16, 0x1000); // size of raw data
+        put32(&mut buf, sec_base + 20, text_rva as u32); // pointer to raw data
+        put32(&mut buf, sec_base + 36, IMPORT_SCN_MEM_READ); // characteristics
 
         // Section header for `.reloc`.
-        buf[sec_base..sec_base + 6].copy_from_slice(b".reloc");
-        put32(&mut buf, sec_base + 8, 0x1000); // virtual size
-        put32(&mut buf, sec_base + 12, reloc_rva as u32); // virtual address
-        put32(&mut buf, sec_base + 16, 0x1000); // size of raw data
-        put32(&mut buf, sec_base + 20, reloc_rva as u32); // pointer to raw data
+        let sec2 = sec_base + 40;
+        buf[sec2..sec2 + 6].copy_from_slice(b".reloc");
+        put32(&mut buf, sec2 + 8, 0x1000);
+        put32(&mut buf, sec2 + 12, reloc_rva as u32);
+        put32(&mut buf, sec2 + 16, 0x1000);
+        put32(&mut buf, sec2 + 20, reloc_rva as u32);
+        put32(&mut buf, sec2 + 36, IMPORT_SCN_MEM_READ);
 
-        // Base-relocation block: page rva 0x2000, block size 12, one DIR64 entry
-        // at page offset 0.
-        put32(&mut buf, reloc_rva, ptr_rva as u32);
+        // `.text` contents: the marker byte and the self-referential pointer.
+        buf[MARKER_RVA] = MARKER_BYTE;
+        put64(&mut buf, PTR_RVA, image_base + PTR_RVA as u64);
+
+        // Base-relocation block: page rva 0x1000, one DIR64 entry at page offset
+        // 8 (targeting PTR_RVA).
+        put32(&mut buf, reloc_rva, text_rva as u32);
         put32(&mut buf, reloc_rva + 4, 12);
-        put16(&mut buf, reloc_rva + 8, REL_DIR64 << 12);
+        put16(
+            &mut buf,
+            reloc_rva + 8,
+            (REL_DIR64 << 12) | (PTR_RVA as u16 - text_rva as u16),
+        );
 
-        // The pointer the relocation fixes up.
-        put64(&mut buf, ptr_rva, pointer_value);
-
-        (buf, ptr_rva)
+        buf
     }
 
     #[test]
     fn parses_headers_and_sections() {
-        let (buf, _) = build_pe(0x1_4000_0000, 0x1_4000_2000);
-        let pe = parse_pe(&buf).unwrap();
+        let pe = parse_pe(&build_pe(0x1_4000_0000)).unwrap();
         assert_eq!(pe.image_base, 0x1_4000_0000);
         assert_eq!(pe.entry_rva, 0x1000);
         assert_eq!(pe.size_of_image, 0x3000);
-        assert_eq!(pe.reloc_dir, (0x1000, 12));
+        assert_eq!(pe.reloc_dir, (0x2000, 12));
         assert!(pe.size_of_headers > 0);
         assert_eq!(pe.import_dir, (0, 0));
-        assert_eq!(pe.sections.len(), 1);
-        assert_eq!(&pe.sections[0].name[..6], b".reloc");
-        assert_eq!(pe.sections[0].virtual_address, 0x1000);
+        assert_eq!(pe.sections.len(), 2);
+        assert_eq!(&pe.sections[0].name[..5], b".text");
+        assert_eq!(&pe.sections[1].name[..6], b".reloc");
         // A non-writable section maps read-only (guest code is translated, not
         // run natively, so it is never host-executable).
         assert_eq!(pe.sections[0].prot(), Prot::Read);
@@ -346,26 +451,41 @@ mod tests {
     #[test]
     fn applies_dir64_relocation() {
         let image_base = 0x1_4000_0000u64;
-        let preferred_ptr = image_base + 0x2000;
-        let (mut image, ptr_rva) = build_pe(image_base, preferred_ptr);
+        let mut image = build_pe(image_base);
         let pe = parse_pe(&image).unwrap();
 
         // Slide the image up by 0x10_0000 and relocate.
-        let actual_base = image_base + 0x10_0000;
-        let delta = actual_base as i64 - image_base as i64;
+        let delta = 0x10_0000i64;
         apply_relocations(&mut image, pe.reloc_dir, delta).unwrap();
 
-        let fixed = u64::from_le_bytes(image[ptr_rva..ptr_rva + 8].try_into().unwrap());
-        assert_eq!(fixed, preferred_ptr + delta as u64);
+        let fixed = u64::from_le_bytes(image[PTR_RVA..PTR_RVA + 8].try_into().unwrap());
+        assert_eq!(fixed, image_base + PTR_RVA as u64 + delta as u64);
     }
 
     #[test]
     fn zero_delta_is_a_noop() {
         let image_base = 0x1_4000_0000u64;
-        let (mut image, ptr_rva) = build_pe(image_base, image_base + 0x2000);
+        let mut image = build_pe(image_base);
         let pe = parse_pe(&image).unwrap();
-        let before = image[ptr_rva..ptr_rva + 8].to_vec();
+        let before = image[PTR_RVA..PTR_RVA + 8].to_vec();
         apply_relocations(&mut image, pe.reloc_dir, 0).unwrap();
-        assert_eq!(&image[ptr_rva..ptr_rva + 8], &before[..]);
+        assert_eq!(&image[PTR_RVA..PTR_RVA + 8], &before[..]);
+    }
+
+    #[test]
+    fn maps_copies_and_relocates() {
+        let image_base = 0x1_4000_0000u64;
+        let mapped = map_pe(&build_pe(image_base)).unwrap();
+
+        assert_eq!(mapped.entry, mapped.base as u64 + MARKER_RVA as u64);
+        unsafe {
+            // The `.text` raw bytes reached their RVA.
+            assert_eq!(*mapped.base.add(MARKER_RVA), MARKER_BYTE);
+            // The self-referential pointer was relocated to its mapped address,
+            // wherever the reservation landed.
+            let ptr = (mapped.base.add(PTR_RVA) as *const u64).read_unaligned();
+            assert_eq!(ptr, mapped.base as u64 + PTR_RVA as u64);
+        }
+        vm::release(mapped.base, mapped.size);
     }
 }
