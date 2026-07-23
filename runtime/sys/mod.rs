@@ -11,6 +11,12 @@ pub mod windows;
 #[cfg(target_arch = "x86_64")]
 pub mod mmap;
 
+// PE parsing feeds the Windows guest loader; it is host-neutral byte work, so
+// it is also compiled into test builds everywhere to keep its unit tests
+// running on the Linux CI host.
+#[cfg(any(windows, test))]
+pub mod pe;
+
 #[cfg(target_arch = "x86_64")]
 pub mod vm;
 
