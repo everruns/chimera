@@ -20,7 +20,7 @@ thiserror = "2"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
 
 [dev-dependencies]
 argh = "0.1.19"
