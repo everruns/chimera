@@ -4,11 +4,15 @@
 //! "compute next guest PC, then exit to the dispatcher" sequence.
 
 use std::{
-    arch::asm,
     mem::offset_of,
     ptr,
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
+
+// The PKRU read/write helpers are the only inline asm here, and they exist only
+// on the protection-key-guarded Linux code cache.
+#[cfg(target_os = "linux")]
+use std::arch::asm;
 
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, CpuidFeature, Decoder, DecoderError, DecoderOptions,
@@ -16,7 +20,10 @@ use iced_x86::{
     Register,
 };
 
-use crate::Error;
+use crate::{
+    Error,
+    sys::vm::{self, Prot},
+};
 
 use super::{dispatch::ThreadState, trampoline::fetch_copy};
 
@@ -51,7 +58,9 @@ const IB_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// canonical or not — so [`CodeCache::clear_ib_table`] additionally repairs
 /// the one slot the all-`0xff` key hashes to (see [`ib_unmatchable`]).
 const IB_EMPTY: u8 = 0xff;
+#[cfg(target_os = "linux")]
 const PKEY_DISABLE_ACCESS: u32 = 0x1;
+#[cfg(target_os = "linux")]
 const PKEY_DISABLE_WRITE: u32 = 0x2;
 const PKEY_UNINIT: i32 = -1;
 const PKEY_ALLOCATING: i32 = -2;
@@ -130,62 +139,40 @@ impl CodeCache {
             size > 0 && size <= crate::MAX_CODE_CACHE_SIZE,
             "code cache size {size} out of range"
         );
-        // Reserve guard + buffer + guard as one `PROT_NONE` mapping, then open
+        // Reserve guard + buffer + guard as one no-access mapping, then open
         // only the middle to RWX. The guards (see [`CACHE_GUARD`]) catch an
         // overrun from an adjacent guest mapping before it reaches the buffer.
         let map_size = CACHE_GUARD + size + CACHE_GUARD;
-        let region = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                map_size,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if region == libc::MAP_FAILED {
-            return Err(Error::last_os_error("code cache reservation"));
-        }
-        let p = unsafe { (region as *mut u8).add(CACHE_GUARD) as *mut libc::c_void };
-        let cache_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-        if unsafe { libc::mprotect(p, size, cache_prot) } != 0 {
-            let err = Error::last_os_error("code cache mprotect");
-            unsafe { libc::munmap(region, map_size) };
+        let region = vm::reserve(map_size)?;
+        let p = unsafe { region.add(CACHE_GUARD) };
+        if let Err(err) = vm::commit(p, size, Prot::ReadWriteExec) {
+            vm::release(region, map_size);
             return Err(err);
         }
         // A host without protection-key support runs the cache RWX and unguarded
         // rather than refusing to start; the tag only matters when a key exists.
         let pkey = acquire_pkey();
         if let Some(pkey) = pkey
-            && let Err(err) = pkey_mprotect(p, size, cache_prot, pkey)
+            && let Err(err) = pkey_mprotect(p, size, pkey)
         {
-            unsafe { libc::munmap(region, map_size) };
+            vm::release(region, map_size);
             return Err(err);
         }
-        let t = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                IB_TABLE_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
+        let t = match vm::map_anon(IB_TABLE_BYTES, Prot::ReadWrite) {
+            Ok(t) => t,
+            Err(err) => {
+                vm::release(region, map_size);
+                return Err(err);
+            }
         };
-        if t == libc::MAP_FAILED {
-            let err = Error::last_os_error("ib table mmap");
-            unsafe { libc::munmap(region, map_size) };
-            return Err(err);
-        }
         let cache = Self {
-            base: p as *mut u8,
+            base: p,
             size,
             pkey,
-            map_base: region as *mut u8,
+            map_base: region,
             map_size,
             used: 0,
-            ib_table: t as *mut u8,
+            ib_table: t,
             ib_lookup: None,
         };
         cache.clear_ib_table();
@@ -400,11 +387,9 @@ impl CodeCache {
 
 impl Drop for CodeCache {
     fn drop(&mut self) {
-        // Unmap the whole reservation (both guards plus the buffer).
-        let ret = unsafe { libc::munmap(self.map_base.cast(), self.map_size) };
-        debug_assert_eq!(ret, 0, "code cache munmap failed");
-        let ret = unsafe { libc::munmap(self.ib_table.cast(), IB_TABLE_BYTES) };
-        debug_assert_eq!(ret, 0, "ib table munmap failed");
+        // Release the whole reservation (both guards plus the buffer).
+        vm::release(self.map_base, self.map_size);
+        vm::release(self.ib_table, IB_TABLE_BYTES);
     }
 }
 
@@ -441,11 +426,22 @@ fn acquire_pkey() -> Option<i32> {
     }
 }
 
+/// Allocate an x86 protection key from the kernel, or `None` where the host has
+/// no user-mode protection keys (every non-Linux host, and a Linux without
+/// `CONFIG_PKEYS`). The Windows code cache runs RWX and unguarded, the same
+/// fallback a keyless Linux takes.
+#[cfg(target_os = "linux")]
 fn allocate_pkey() -> Option<i32> {
     let raw = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, 0) };
     (raw >= 0).then_some(raw as i32)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn allocate_pkey() -> Option<i32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 pub fn mpk_enabled() -> bool {
     let Some(pkey) = allocate_pkey() else {
         return false;
@@ -454,12 +450,17 @@ pub fn mpk_enabled() -> bool {
     true
 }
 
-fn pkey_mprotect(
-    addr: *mut libc::c_void,
-    len: usize,
-    prot: libc::c_int,
-    pkey: i32,
-) -> Result<(), Error> {
+#[cfg(not(target_os = "linux"))]
+pub fn mpk_enabled() -> bool {
+    false
+}
+
+/// Tag the code-cache pages with the protection key so guest threads run with
+/// writes to them disabled in PKRU. Only reached when [`acquire_pkey`] returned
+/// a real key, which never happens off Linux.
+#[cfg(target_os = "linux")]
+fn pkey_mprotect(addr: *mut u8, len: usize, pkey: i32) -> Result<(), Error> {
+    let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
     let ret = unsafe { libc::syscall(libc::SYS_pkey_mprotect, addr, len, prot, pkey) };
     if ret != 0 {
         return Err(Error::last_os_error("code cache pkey_mprotect"));
@@ -467,6 +468,12 @@ fn pkey_mprotect(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn pkey_mprotect(_addr: *mut u8, _len: usize, _pkey: i32) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn set_pkey_write_disabled(pkey: i32, disabled: bool) {
     let shift = (pkey as u32) * 2;
     let mask = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << shift;
@@ -478,6 +485,10 @@ fn set_pkey_write_disabled(pkey: i32, disabled: bool) {
     write_pkru(pkru);
 }
 
+#[cfg(not(target_os = "linux"))]
+fn set_pkey_write_disabled(_pkey: i32, _disabled: bool) {}
+
+#[cfg(target_os = "linux")]
 fn read_pkru() -> u32 {
     let eax: u32;
     let edx: u32;
@@ -493,6 +504,7 @@ fn read_pkru() -> u32 {
     ((edx as u64) << 32 | eax as u64) as u32
 }
 
+#[cfg(target_os = "linux")]
 fn write_pkru(pkru: u32) {
     unsafe {
         asm!(

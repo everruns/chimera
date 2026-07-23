@@ -1,18 +1,12 @@
 //! The guest address space: the translated-block cache ([`BlockCache`]) and the
 //! guest mappings Chimera owns on the host.
 
-use std::{
-    collections::HashSet,
-    io,
-    sync::{
-        OnceLock,
-        atomic::{AtomicI32, Ordering},
-    },
-};
+use std::collections::HashSet;
 
 use crate::{
     Error,
     arch::x86::{cache::BlockCache, trampoline::guarded_copy},
+    sys::vm::{self, Prot},
 };
 
 /// Guest page size (x86-64); SMC arming and invalidation work per page.
@@ -131,13 +125,7 @@ impl AddressSpace {
         self.code.code_deny_writes();
         self.granted.insert(page);
         // Restore the guest's writable mapping (never executable on the host).
-        unsafe {
-            libc::mprotect(
-                page as *mut libc::c_void,
-                PAGE,
-                libc::PROT_READ | libc::PROT_WRITE,
-            );
-        }
+        let _ = vm::protect(page as *mut u8, PAGE, Prot::ReadWrite);
         true
     }
 
@@ -150,7 +138,7 @@ impl AddressSpace {
         for page in pages(start as usize, (end - start) as usize) {
             if self.armed.insert(page) {
                 self.granted.remove(&page);
-                unsafe { libc::mprotect(page as *mut libc::c_void, PAGE, libc::PROT_READ) };
+                let _ = vm::protect(page as *mut u8, PAGE, Prot::Read);
             }
         }
     }
@@ -241,8 +229,7 @@ impl AddressSpace {
 
     fn clear_regions(&mut self) {
         for region in self.regions.drain(..) {
-            let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
-            debug_assert_eq!(ret, 0, "guest region munmap failed");
+            vm::unmap(region.start as *mut u8, region.len);
         }
     }
 
@@ -270,49 +257,15 @@ impl Drop for AddressSpace {
     }
 }
 
-/// The runtime's pid, cached for the self-targeted `process_vm` copies below.
-/// glibc has not cached `getpid()` since 2.25, so taking it per copy doubles
-/// each copy's syscall bill. A fork invalidates the value (a stale pid would
-/// aim the copies at the *parent's* address space), so Chimera registers a
-/// `pthread_atfork` child hook for host forks and still drops the cache from
-/// [`Thread::reset_after_fork`] for the guest's raw-`clone` fork path, which
-/// never runs libc's fork handlers.
-///
-/// [`Thread::reset_after_fork`]: crate::arch::x86::dispatch::Thread::reset_after_fork
-static CACHED_PID: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn reset_cached_pid_after_fork() {
-    reset_cached_pid();
-}
-
+/// One-time process setup the address space needs (see [`vm::init`]).
 pub fn init() -> Result<(), Error> {
-    static INIT: OnceLock<Result<(), i32>> = OnceLock::new();
-
-    match INIT.get_or_init(|| {
-        let ret = unsafe { libc::pthread_atfork(None, None, Some(reset_cached_pid_after_fork)) };
-        if ret == 0 { Ok(()) } else { Err(ret) }
-    }) {
-        Ok(()) => Ok(()),
-        Err(err) => Err(Error::io(
-            "pthread_atfork",
-            io::Error::from_raw_os_error(*err),
-        )),
-    }
+    vm::init()
 }
 
-fn own_pid() -> libc::pid_t {
-    let pid = CACHED_PID.load(Ordering::Relaxed);
-    if pid != 0 {
-        return pid;
-    }
-    let pid = unsafe { libc::getpid() };
-    CACHED_PID.store(pid, Ordering::Relaxed);
-    pid
-}
-
-/// Drop the cached pid in the child of a fork; the next copy re-reads it.
+/// Drop any cached process identity in the child of a raw-`clone` fork the C
+/// library's fork handlers never saw (see [`vm::reset_after_fork`]).
 pub fn reset_cached_pid() {
-    CACHED_PID.store(0, Ordering::Relaxed);
+    vm::reset_after_fork()
 }
 
 /// Copy `buf.len()` bytes out of guest memory at `addr` without trusting the
@@ -337,30 +290,14 @@ pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
 }
 
 /// Copy `buf` into guest memory at `addr` without trusting the pointer — the
-/// write-side twin of [`copy_from_guest`], a self-targeted
-/// `process_vm_writev`. The kernel walks the page tables, so an unmapped or
-/// read-only range fails the copy exactly where a raw store would fault the
-/// runtime. Returns false on any failed or short copy; callers that mirror
-/// one of the kernel's unchecked `put_user` sites (the clone set-TID words,
-/// the exit-time `clear_child_tid` store) ignore the result, since the kernel
-/// skips those writes silently.
+/// write-side twin of [`copy_from_guest`] (see [`vm::copy_to_guest`]). An
+/// unmapped or read-only range fails the copy exactly where a raw store would
+/// fault the runtime. Returns false on any failed or short copy; callers that
+/// mirror one of the kernel's unchecked `put_user` sites (the clone set-TID
+/// words, the exit-time `clear_child_tid` store) ignore the result, since the
+/// kernel skips those writes silently.
 pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
-    if buf.is_empty() {
-        return true;
-    }
-    if addr == 0 {
-        return false;
-    }
-    let local = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let remote = libc::iovec {
-        iov_base: addr as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let copied = unsafe { libc::process_vm_writev(own_pid(), &local, 1, &remote, 1, 0) };
-    copied == buf.len() as isize
+    vm::copy_to_guest(addr, buf)
 }
 
 /// Page-aligned base addresses of every page the range `[start, start+len)`
@@ -382,24 +319,14 @@ fn round_mapping_len(len: usize) -> usize {
         return 0;
     }
 
-    let page_size = host_page_size();
+    let page_size = vm::page_size();
     match len.checked_add(page_size - 1) {
         Some(rounded) => rounded / page_size * page_size,
         None => usize::MAX / page_size * page_size,
     }
 }
 
-fn host_page_size() -> usize {
-    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-
-    *PAGE_SIZE.get_or_init(|| {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        assert!(page_size > 0, "host page size unavailable");
-        page_size as usize
-    })
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::ptr;
