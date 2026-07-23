@@ -153,3 +153,51 @@ const _: () = assert!(
     core::mem::offset_of!(ThreadState, fpstate) % 64 == 0,
     "ThreadState::fpstate must be 64-byte aligned for XSAVE/XRSTOR"
 );
+
+/// x86-64 `RSP` register index in [`ThreadState::regs`]. The Linux run loop has
+/// its own copy in `dispatch`; this one serves the Windows [`fresh`] builder.
+///
+/// [`fresh`]: ThreadState::fresh
+#[cfg(windows)]
+pub const RSP: usize = 7;
+
+#[cfg(windows)]
+impl ThreadState {
+    /// A fresh register file for a guest entering at `rip` with stack pointer
+    /// `rsp` and virtualized-segment base `seg_base` (the guest's `fs` base on
+    /// Linux, `gs`/TEB base on Windows). Every other register is zero, the
+    /// flags carry the reserved bit and interrupt flag a fresh thread has, and
+    /// the FP save area is seeded so the first `XRSTOR` loads the ABI-default
+    /// `MXCSR` (all SSE exceptions masked) rather than an all-zero word that
+    /// would fault ordinary float math.
+    pub fn fresh(rip: u64, rsp: u64, seg_base: u64) -> Box<Self> {
+        let mut ts = Box::new(Self {
+            regs: [0; 16],
+            rip,
+            rflags: 0x202,
+            chimera_rsp: 0,
+            host_pc_target: 0,
+            exit_kind: 0,
+            guest_fs_base: seg_base,
+            chimera_fs_base: 0,
+            ib_lookup: 0,
+            ib_flags: 0,
+            ib_target: 0,
+            ib_rcx: 0,
+            ib_rdx: 0,
+            ib_host: 0,
+            exit_requested: AtomicU32::new(0),
+            fp_in_regs: 0,
+            fp_flags: 0,
+            fp_scratch: 0,
+            fpstate: [0; XSAVE_AREA_SIZE],
+            fs_is_guest: 0,
+            pending_set: 0,
+            tid: AtomicI32::new(0),
+            riprel_scratch: 0,
+        });
+        ts.regs[RSP] = rsp;
+        ts.fpstate[24..28].copy_from_slice(&0x0000_1f80u32.to_le_bytes());
+        ts
+    }
+}

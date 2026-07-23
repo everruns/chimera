@@ -572,15 +572,7 @@ fn ib_unmatchable(key: u64) -> u64 {
 /// `<ctx>:[disp]` with a 32-bit displacement, qword-sized — an operand on the
 /// context segment (`gs` on Linux, `fs` on Windows).
 fn gs_qword(disp: i64) -> MemoryOperand {
-    MemoryOperand::new(
-        Register::None,
-        Register::None,
-        1,
-        disp,
-        4,
-        false,
-        CTX_SEG,
-    )
+    MemoryOperand::new(Register::None, Register::None, 1, disp, 4, false, CTX_SEG)
 }
 
 /// A patchable outgoing edge of a translated block: the guest PC of a
