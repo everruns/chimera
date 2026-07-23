@@ -52,9 +52,10 @@ fn run_image(
     let image = map_pe(file)?;
 
     let stack = vm::map_anon(STACK_SIZE, Prot::ReadWrite)?;
-    // rsp holds a null return address at the top of the stack, 16-byte aligned.
+    // rsp holds the exit sentinel as the top-level return address, 16-byte
+    // aligned, so a `ret` with an empty call stack exits cleanly.
     let rsp = (stack as u64 + STACK_SIZE as u64 - 16) & !15;
-    unsafe { std::ptr::write(rsp as *mut u64, 0u64) };
+    unsafe { std::ptr::write(rsp as *mut u64, super::run::EXIT_SENTINEL) };
 
     let teb = vm::map_anon(TEB_SIZE, Prot::ReadWrite)?;
 

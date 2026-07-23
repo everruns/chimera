@@ -256,6 +256,16 @@ pub fn map_pe(file: &[u8]) -> Result<MappedImage, Error> {
     if size == 0 {
         return Err(bad("image has zero size"));
     }
+    // A PE with an import directory depends on functions from other DLLs that
+    // Chimera does not yet resolve. Refuse it here rather than mapping an image
+    // whose import-address-table thunks stay unbound — a guest call through one
+    // would jump to a bogus address and fault (or worse, be mistaken for a null
+    // exit). Only freestanding images (no imports) run today.
+    if pe.import_dir.1 != 0 {
+        return Err(Error::Unsupported(
+            "PE imports are not yet resolved on a Windows host".into(),
+        ));
+    }
     let base = vm::reserve(size)?;
 
     // A closure so any failure past this point releases the reservation.
@@ -470,6 +480,16 @@ mod tests {
         let before = image[PTR_RVA..PTR_RVA + 8].to_vec();
         apply_relocations(&mut image, pe.reloc_dir, 0).unwrap();
         assert_eq!(&image[PTR_RVA..PTR_RVA + 8], &before[..]);
+    }
+
+    #[test]
+    fn map_rejects_unresolved_imports() {
+        let mut file = build_pe(0x1_4000_0000);
+        // Point data directory 1 (imports) at a non-empty region.
+        let dir1 = (0x40 + 4 + 20) + 112 + DIR_IMPORT * 8;
+        file[dir1..dir1 + 4].copy_from_slice(&0x100u32.to_le_bytes());
+        file[dir1 + 4..dir1 + 8].copy_from_slice(&0x14u32.to_le_bytes());
+        assert!(matches!(map_pe(&file), Err(Error::Unsupported(_))));
     }
 
     #[test]

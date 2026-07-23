@@ -21,11 +21,15 @@
 //!
 //! ## Exit
 //!
-//! A guest that returns to program counter zero — a top-level `ret` whose return
-//! address the loader seeded to null — is a clean exit, with the guest's `rax`
-//! as the status. This mirrors the Darwin port's `pc == 0` sentinel and needs
-//! no build-specific `NtTerminateProcess` number; richer NT-call interception,
-//! including terminate, belongs to the embedder handler and later stages.
+//! A guest that returns to the [`EXIT_SENTINEL`] — a top-level `ret` whose
+//! return address the loader seeded there — is a clean exit, with the guest's
+//! `rax` as the status, a freestanding-guest convention that needs no
+//! build-specific `NtTerminateProcess` number. The sentinel is a non-canonical
+//! address, deliberately distinct from a null pointer, so a null-pointer call or
+//! an unresolved import (both landing on `rip == 0`) faults as
+//! [`Error::BadAccess`] instead of being mistaken for a clean exit. Richer
+//! NT-call interception, including terminate, belongs to the embedder handler
+//! and later stages.
 
 use std::arch::asm;
 
@@ -41,6 +45,15 @@ use crate::{
 const RAX: usize = 0;
 const EXIT_KIND_SYSCALL: u64 = crate::arch::x86::state::EXIT_KIND_SYSCALL;
 const EXIT_KIND_TRAP: u64 = crate::arch::x86::state::EXIT_KIND_TRAP;
+
+/// The return address the loader seeds under the guest's entry, recognized by
+/// the run loop as a clean exit when a top-level `ret` pops it. It is a
+/// non-canonical address, so it is distinct from a genuine jump or call to a
+/// null (or any other real) pointer: those fall through to translation and fault
+/// as [`Error::BadAccess`] rather than being mistaken for a clean exit. This is
+/// a freestanding-guest convention; a real guest terminates through
+/// `NtTerminateProcess`, which the embedder handler intercepts.
+pub const EXIT_SENTINEL: u64 = 0xDEAD_0000_0000_0000;
 
 /// A running guest: its register file, the address space it translates from, and
 /// the embedder syscall handler. One guest, one host thread, for now.
@@ -98,8 +111,11 @@ impl Guest {
             let ts: *mut ThreadState = &mut *self.state;
             let rip = unsafe { (*ts).rip };
 
-            // The clean-exit sentinel: a top-level `ret` to a null return address.
-            if rip == 0 {
+            // A top-level `ret` popped the seeded exit sentinel: clean exit with
+            // the guest's rax as the status. A jump to any other unmapped
+            // address — a null-pointer call, an unresolved import — is not this,
+            // and falls through to translation, which faults.
+            if rip == EXIT_SENTINEL {
                 self.exit_code = unsafe { (*ts).regs[RAX] } as i32;
                 break;
             }
@@ -178,6 +194,14 @@ mod tests {
         seen: Mutex<Vec<SystemCall>>,
     }
 
+    impl Recorder {
+        fn deny() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     impl SystemCalls for Recorder {
         fn do_syscall(&self, call: &mut SystemCall) {
             self.seen
@@ -199,7 +223,7 @@ mod tests {
         let stack_len = 64 * 1024;
         let stack = vm::map_anon(stack_len, Prot::ReadWrite).unwrap();
         let rsp = stack as u64 + stack_len as u64 - 8;
-        unsafe { std::ptr::write(rsp as *mut u64, 0u64) };
+        unsafe { std::ptr::write(rsp as *mut u64, EXIT_SENTINEL) };
 
         let mut addr = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
         addr.add_region(code_region as usize, page);
@@ -227,10 +251,24 @@ mod tests {
 
     #[test]
     fn runs_a_block_returns_exit_code() {
-        // mov eax, 42 ; ret   (ret -> null return address -> clean exit)
+        // mov eax, 42 ; ret   (ret -> exit sentinel -> clean exit)
         let (exit, seen) = run_code(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
         assert_eq!(exit, 42);
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn null_jump_faults_rather_than_exiting() {
+        // xor eax,eax ; jmp rax  — an indirect jump to a null pointer. This must
+        // fault (BadAccess at 0), not be mistaken for the clean-exit sentinel.
+        let page = vm::page_size();
+        let code_region = vm::map_anon(page, Prot::ReadWrite).unwrap();
+        let code = [0x31, 0xC0, 0xFF, 0xE0];
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), code_region, code.len()) };
+        let mut addr = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
+        addr.add_region(code_region as usize, page);
+        let mut guest = Guest::new(Box::new(Recorder::deny()), addr, code_region as u64, 0, 0);
+        assert!(matches!(guest.run(), Err(Error::BadAccess(0))));
     }
 
     #[test]
