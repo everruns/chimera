@@ -42,13 +42,14 @@ jobs:
         if: runner.os == 'Linux'
         run: make conformance
 
-  # The Windows guest port is in progress: the host abstraction layer (sys::vm,
-  # the vectored-exception fault handler, the Win64 trampoline) and the DBT
-  # primitives build and unit-test on Windows, while the guest run loop, the
-  # CLI's Linux VFS surface, the examples, and conformance remain Linux-only.
-  # This job guards the parts that do build; widen it as the port fills in.
+  # The Windows guest port runs PE guests: the runtime library and the chimera
+  # CLI build, and the runtime's unit tests (the guest run loop — execution,
+  # syscall interception, FP, segment virtualization, self-modifying code — and
+  # the PE loader) run on the Windows runner. The examples' Linux VFS surface and
+  # the conformance suite remain Linux-only. Not yet parity: system-DLL imports,
+  # threads, exception delivery, and NT-syscall passthrough.
   windows:
-    name: windows-latest (runtime)
+    name: windows-latest
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +63,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: build
-        run: cargo build -p chimera-runtime --lib --locked
+        run: cargo build -p chimera-runtime -p chimera-cli --locked
 
       - name: test
         run: cargo test -p chimera-runtime --lib --locked
