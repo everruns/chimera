@@ -68,6 +68,38 @@ const PKEY_ALLOCATING: i32 = -2;
 /// exhausted. The cache then runs unguarded rather than refusing to start.
 const PKEY_UNSUPPORTED: i32 = -3;
 
+// The context segment carries the running thread's `ThreadState` pointer, so
+// translated code reaches any field with a `<ctx>:[disp]` access. The two hosts
+// pick different segments for it, and mirror the choice: Linux uses `gs` (free,
+// since its TLS lives on `fs`) and virtualizes the guest's `fs`; Windows keeps
+// the TEB in `gs` and cannot repurpose it, so the context lives on `fs` and it
+// is the guest's `gs` that is virtualized. `CTX_PREFIX` is the segment-override
+// prefix byte the raw stub emitters splice in; `CTX_SEG` is the iced register
+// for the operands the encoder lays out.
+#[cfg(not(windows))]
+const CTX_PREFIX: u8 = 0x65; // gs
+#[cfg(windows)]
+const CTX_PREFIX: u8 = 0x64; // fs
+#[cfg(not(windows))]
+const CTX_SEG: Register = Register::GS;
+#[cfg(windows)]
+const CTX_SEG: Register = Register::FS;
+
+/// The guest segment Chimera virtualizes per residency — `fs` on Linux, `gs` on
+/// Windows. A guest access through it (or an `rd/wrfsbase` / `rd/wrgsbase`)
+/// marks the block as needing the lazy segment-base install in its prologue.
+#[cfg(not(windows))]
+const GUEST_SEG: Register = Register::FS;
+#[cfg(windows)]
+const GUEST_SEG: Register = Register::GS;
+
+/// ModRM byte to write the guest segment's base from rax: `wrfsbase rax`
+/// (`f3 48 0f ae d0`) on Linux, `wrgsbase rax` (`…d8`) on Windows.
+#[cfg(not(windows))]
+const WRBASE_RAX_MODRM: u8 = 0xd0;
+#[cfg(windows)]
+const WRBASE_RAX_MODRM: u8 = 0xd8;
+
 /// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
 /// need a scratch memory slot borrow it: `exit_block` re-saves the live rbx
 /// over the slot on the way out, so the guest's rbx register is preserved.
@@ -332,7 +364,7 @@ impl CodeCache {
         // delivering at a clean boundary with the right guest PC. The guest's flags
         // are saved in gs:[ib_flags] here (restored on both the hit and miss
         // paths), so this `cmp`'s flag clobber is harmless.
-        out.extend_from_slice(&[0x65, 0x83, 0x3c, 0x25]); // cmp dword ptr gs:[exit_requested], 0
+        out.extend_from_slice(&[CTX_PREFIX, 0x83, 0x3c, 0x25]); // cmp dword ptr <ctx>:[exit_requested], 0
         emit_u32(&mut out, offset_of!(ThreadState, exit_requested) as u32);
         out.push(0x00);
         out.extend_from_slice(&[0x0f, 0x85]); // jne miss
@@ -354,7 +386,7 @@ impl CodeCache {
         gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
         gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
         gs_load(&mut out, MODRM_RAX, d_rax); // mov rax, gs:[0]  (guest rax)
-        out.extend_from_slice(&[0x65, 0xff, 0x24, 0x25]); // jmp gs:[host]
+        out.extend_from_slice(&[CTX_PREFIX, 0xff, 0x24, 0x25]); // jmp <ctx>:[host]
         emit_u32(&mut out, d_host as u32);
 
         // Miss: restore flags and registers, publish the target as the next
@@ -537,7 +569,8 @@ fn ib_unmatchable(key: u64) -> u64 {
     key ^ (1 << 63)
 }
 
-/// `gs:[disp]` with a 32-bit displacement, qword-sized.
+/// `<ctx>:[disp]` with a 32-bit displacement, qword-sized — an operand on the
+/// context segment (`gs` on Linux, `fs` on Windows).
 fn gs_qword(disp: i64) -> MemoryOperand {
     MemoryOperand::new(
         Register::None,
@@ -546,7 +579,7 @@ fn gs_qword(disp: i64) -> MemoryOperand {
         disp,
         4,
         false,
-        Register::GS,
+        CTX_SEG,
     )
 }
 
@@ -804,23 +837,31 @@ fn block_uses_fp(body: &[Instruction], term: &Instruction) -> bool {
         .any(|i| instr_uses_fp(&mut info, i))
 }
 
-/// Whether any instruction in the block reads or writes through the FS segment
-/// — a `fs:`-prefixed memory access (guest TLS) or an `rd/wrfsbase` — and so
-/// needs the guest's FS base installed rather than Chimera's. A block that
-/// never touches FS runs correctly with Chimera's base still in FS, sparing the
-/// `wrfsbase` pair around the residency.
+/// Whether any instruction in the block reads or writes through the virtualized
+/// guest segment — a prefixed memory access (guest TLS) or an
+/// `rd/wr{fs,gs}base` — and so needs the guest's segment base installed rather
+/// than Chimera's. The guest segment is `fs` on Linux and `gs` on Windows (see
+/// [`GUEST_SEG`]). A block that never touches it runs correctly with Chimera's
+/// base still loaded, sparing the base-swap pair around the residency.
 fn block_uses_fs(body: &[Instruction], term: &Instruction) -> bool {
     body.iter().chain(std::iter::once(term)).any(instr_uses_fs)
 }
 
 fn instr_uses_fs(instr: &Instruction) -> bool {
-    if instr.segment_prefix() == Register::FS {
+    if instr.segment_prefix() == GUEST_SEG {
         return true;
     }
-    matches!(
+    #[cfg(not(windows))]
+    let base_op = matches!(
         instr.code(),
         Code::Rdfsbase_r32 | Code::Rdfsbase_r64 | Code::Wrfsbase_r32 | Code::Wrfsbase_r64
-    )
+    );
+    #[cfg(windows)]
+    let base_op = matches!(
+        instr.code(),
+        Code::Rdgsbase_r32 | Code::Rdgsbase_r64 | Code::Wrgsbase_r32 | Code::Wrgsbase_r64
+    );
+    base_op
 }
 
 fn instr_uses_fp(info: &mut InstructionInfoFactory, instr: &Instruction) -> bool {
@@ -1132,8 +1173,8 @@ fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
     let d_rcx = offset_of!(ThreadState, ib_rcx) as i32;
     // mov gs:[ib_rcx], rcx — stash guest rcx (no flags touched).
     gs_store(out, MODRM_RCX, d_rcx);
-    // mov ecx, gs:[exit_requested] — rcx = flag, zero-extended (no flags touched).
-    out.extend_from_slice(&[0x65, 0x8b, 0x0c, 0x25]);
+    // mov ecx, <ctx>:[exit_requested] — rcx = flag, zero-extended (no flags touched).
+    out.extend_from_slice(&[CTX_PREFIX, 0x8b, 0x0c, 0x25]);
     emit_u32(out, d_exit as u32);
     // jrcxz .cont — take the fast path if the flag is clear; preserves flags.
     out.push(0xe3);
@@ -1348,9 +1389,9 @@ fn emit_stub(out: &mut Vec<u8>, target_guest: u64, exit_tramp: u64) {
     out.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
 }
 
-/// `mov gs:[disp32], rax` — `65 48 89 04 25 <disp32>`.
+/// `mov <ctx>:[disp32], rax` — `<pfx> 48 89 04 25 <disp32>`.
 fn mov_gs_rax(out: &mut Vec<u8>, disp: i32) {
-    out.extend_from_slice(&[0x65, 0x48, 0x89, 0x04, 0x25]);
+    out.extend_from_slice(&[CTX_PREFIX, 0x48, 0x89, 0x04, 0x25]);
     emit_u32(out, disp as u32);
 }
 
@@ -1371,15 +1412,15 @@ const MODRM_RAX: u8 = 0x04;
 const MODRM_RCX: u8 = 0x0c;
 const MODRM_RDX: u8 = 0x14;
 
-/// `mov gs:[disp32], <reg>` — `65 48 89 <modrm> 25 <disp32>`.
+/// `mov <ctx>:[disp32], <reg>` — `<pfx> 48 89 <modrm> 25 <disp32>`.
 fn gs_store(out: &mut Vec<u8>, modrm: u8, disp: i32) {
-    out.extend_from_slice(&[0x65, 0x48, 0x89, modrm, 0x25]);
+    out.extend_from_slice(&[CTX_PREFIX, 0x48, 0x89, modrm, 0x25]);
     emit_u32(out, disp as u32);
 }
 
-/// `mov <reg>, gs:[disp32]` — `65 48 8b <modrm> 25 <disp32>`.
+/// `mov <reg>, <ctx>:[disp32]` — `<pfx> 48 8b <modrm> 25 <disp32>`.
 fn gs_load(out: &mut Vec<u8>, modrm: u8, disp: i32) {
-    out.extend_from_slice(&[0x65, 0x48, 0x8b, modrm, 0x25]);
+    out.extend_from_slice(&[CTX_PREFIX, 0x48, 0x8b, modrm, 0x25]);
     emit_u32(out, disp as u32);
 }
 
@@ -1476,31 +1517,32 @@ fn emit_fp_restore(out: &mut Vec<u8>, d_fps: i32, d_scr: i32, d_in: i32) {
     gs_store(out, MODRM_RDX, d_scr); // mov gs:[fp_scratch], rdx
     out.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]); // mov eax, 0xe7
     out.extend_from_slice(&[0x31, 0xd2]); // xor edx, edx
-    out.extend_from_slice(&[0x65, 0x48, 0x0f, 0xae, 0x2c, 0x25]); // xrstor64 gs:[
+    out.extend_from_slice(&[CTX_PREFIX, 0x48, 0x0f, 0xae, 0x2c, 0x25]); // xrstor64 <ctx>:[
     emit_u32(out, d_fps as u32); //   fpstate]
     gs_load(out, MODRM_RDX, d_scr); // mov rdx, gs:[fp_scratch]
     mov_gs_byte_one(out, d_in); // mov byte gs:[fp_in_regs], 1
 }
 
-/// Emit the FS-base install: load the guest base from `gs:[guest_fs_base]` into
-/// rax, `wrfsbase` it, and set `fs_is_guest`. Assumes rax is already saved and
-/// reloaded by the caller.
+/// Emit the guest segment-base install: load the guest base from
+/// `<ctx>:[guest_fs_base]` into rax, write it to the virtualized segment's base
+/// (`wrfsbase` on Linux, `wrgsbase` on Windows), and set `fs_is_guest`. Assumes
+/// rax is already saved and reloaded by the caller.
 fn emit_fs_install(out: &mut Vec<u8>, d_guest_fs: i32, d_fs: i32) {
-    gs_load(out, MODRM_RAX, d_guest_fs); // mov rax, gs:[guest_fs_base]
-    out.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, 0xd0]); // wrfsbase rax
-    mov_gs_byte_one(out, d_fs); // mov byte gs:[fs_is_guest], 1
+    gs_load(out, MODRM_RAX, d_guest_fs); // mov rax, <ctx>:[guest_fs_base]
+    out.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, WRBASE_RAX_MODRM]); // wr{fs,gs}base rax
+    mov_gs_byte_one(out, d_fs); // mov byte <ctx>:[fs_is_guest], 1
 }
 
-/// `cmp byte ptr gs:[disp32], 0` — `65 80 3c 25 <disp32> 00`.
+/// `cmp byte ptr <ctx>:[disp32], 0` — `<pfx> 80 3c 25 <disp32> 00`.
 fn cmp_gs_byte_zero(out: &mut Vec<u8>, disp: i32) {
-    out.extend_from_slice(&[0x65, 0x80, 0x3c, 0x25]);
+    out.extend_from_slice(&[CTX_PREFIX, 0x80, 0x3c, 0x25]);
     emit_u32(out, disp as u32);
     out.push(0x00);
 }
 
-/// `mov byte ptr gs:[disp32], 1` — `65 c6 04 25 <disp32> 01`.
+/// `mov byte ptr <ctx>:[disp32], 1` — `<pfx> c6 04 25 <disp32> 01`.
 fn mov_gs_byte_one(out: &mut Vec<u8>, disp: i32) {
-    out.extend_from_slice(&[0x65, 0xc6, 0x04, 0x25]);
+    out.extend_from_slice(&[CTX_PREFIX, 0xc6, 0x04, 0x25]);
     emit_u32(out, disp as u32);
     out.push(0x01);
 }
