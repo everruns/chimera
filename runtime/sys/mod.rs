@@ -5,11 +5,20 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(windows)]
+pub mod windows;
+
 #[cfg(target_arch = "x86_64")]
 pub mod mmap;
 
 #[cfg(target_arch = "x86_64")]
 pub mod vm;
 
+// Host-neutral seams over the per-OS backends. `exec` is the guest run entry,
+// `host_syscall` the forward-to-kernel bridge the default handler uses, and
+// `fault` the guarded-copy recovery installer.
 #[cfg(target_os = "linux")]
-pub use linux::exec;
+pub use linux::{exec, fault, syscall::host_syscall};
+
+#[cfg(windows)]
+pub use windows::{exec, fault, syscall::host_syscall};

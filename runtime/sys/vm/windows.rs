@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
-    PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    VirtualProtect,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -59,8 +60,14 @@ pub fn commit(addr: *mut u8, len: usize, prot: Prot) -> Result<(), Error> {
 }
 
 pub fn map_anon(len: usize, prot: Prot) -> Result<*mut u8, Error> {
-    let region =
-        unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, prot_flags(prot)) };
+    let region = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            len,
+            MEM_RESERVE | MEM_COMMIT,
+            prot_flags(prot),
+        )
+    };
     if region.is_null() {
         return Err(Error::last_os_error("VirtualAlloc"));
     }

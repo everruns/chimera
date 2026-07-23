@@ -23,42 +23,54 @@
 
 use std::{arch::global_asm, mem::offset_of};
 
-use super::dispatch::{EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, ThreadState};
+use super::state::{EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, ThreadState};
 
 /// Byte offset of `ThreadState::regs[idx]`.
 const fn reg_off(idx: usize) -> usize {
     offset_of!(ThreadState, regs) + idx * 8
 }
 
-global_asm!(
-    include_str!("trampoline.S"),
-    TS_RAX         = const reg_off(0),
-    TS_RBX         = const reg_off(1),
-    TS_RCX         = const reg_off(2),
-    TS_RDX         = const reg_off(3),
-    TS_RSI         = const reg_off(4),
-    TS_RDI         = const reg_off(5),
-    TS_RBP         = const reg_off(6),
-    TS_RSP         = const reg_off(7),
-    TS_R8          = const reg_off(8),
-    TS_R9          = const reg_off(9),
-    TS_R10         = const reg_off(10),
-    TS_R11         = const reg_off(11),
-    TS_R12         = const reg_off(12),
-    TS_R13         = const reg_off(13),
-    TS_R14         = const reg_off(14),
-    TS_R15         = const reg_off(15),
-    TS_RFLAGS      = const offset_of!(ThreadState, rflags),
-    TS_CHIMERA_RSP = const offset_of!(ThreadState, chimera_rsp),
-    TS_HOST_PC     = const offset_of!(ThreadState, host_pc_target),
-    TS_EXIT_KIND   = const offset_of!(ThreadState, exit_kind),
-    TS_FPSTATE     = const offset_of!(ThreadState, fpstate),
-    TS_FP_IN_REGS  = const offset_of!(ThreadState, fp_in_regs),
-    TS_FS_IS_GUEST = const offset_of!(ThreadState, fs_is_guest),
-    TS_CHIMERA_FS  = const offset_of!(ThreadState, chimera_fs_base),
-    EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
-    EXIT_KIND_TRAP = const EXIT_KIND_TRAP,
-);
+// The two hosts share this operand list; only the assembly file differs (System
+// V `gs:`-context vs Win64 `fs:`-context). A macro keeps the offsets in one
+// place so the two `global_asm!` invocations can never drift apart.
+macro_rules! trampoline_asm {
+    ($file:literal) => {
+        global_asm!(
+            include_str!($file),
+            TS_RAX         = const reg_off(0),
+            TS_RBX         = const reg_off(1),
+            TS_RCX         = const reg_off(2),
+            TS_RDX         = const reg_off(3),
+            TS_RSI         = const reg_off(4),
+            TS_RDI         = const reg_off(5),
+            TS_RBP         = const reg_off(6),
+            TS_RSP         = const reg_off(7),
+            TS_R8          = const reg_off(8),
+            TS_R9          = const reg_off(9),
+            TS_R10         = const reg_off(10),
+            TS_R11         = const reg_off(11),
+            TS_R12         = const reg_off(12),
+            TS_R13         = const reg_off(13),
+            TS_R14         = const reg_off(14),
+            TS_R15         = const reg_off(15),
+            TS_RFLAGS      = const offset_of!(ThreadState, rflags),
+            TS_CHIMERA_RSP = const offset_of!(ThreadState, chimera_rsp),
+            TS_HOST_PC     = const offset_of!(ThreadState, host_pc_target),
+            TS_EXIT_KIND   = const offset_of!(ThreadState, exit_kind),
+            TS_FPSTATE     = const offset_of!(ThreadState, fpstate),
+            TS_FP_IN_REGS  = const offset_of!(ThreadState, fp_in_regs),
+            TS_FS_IS_GUEST = const offset_of!(ThreadState, fs_is_guest),
+            TS_CHIMERA_FS  = const offset_of!(ThreadState, chimera_fs_base),
+            EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
+            EXIT_KIND_TRAP = const EXIT_KIND_TRAP,
+        );
+    };
+}
+
+#[cfg(unix)]
+trampoline_asm!("trampoline.S");
+#[cfg(windows)]
+trampoline_asm!("trampoline_win.S");
 
 unsafe extern "C" {
     pub fn dispatch(ctx: *mut ThreadState, host_pc: u64);
@@ -113,32 +125,22 @@ mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::sys::vm::{self, Prot};
 
     const PAGE: usize = 4096;
 
     #[test]
     fn fetch_copy_returns_readable_prefix() {
-        crate::sys::linux::fault::install();
+        crate::sys::fault::install();
 
-        // A readable page followed by a PROT_NONE page, so a copy can start
-        // readable and fault partway through.
-        let map = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                PAGE * 2,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(map, libc::MAP_FAILED);
-        let base = map as usize;
-        unsafe {
-            ptr::write_bytes(map as *mut u8, 0xab, PAGE);
-            let ret = libc::mprotect((base + PAGE) as *mut libc::c_void, PAGE, libc::PROT_NONE);
-            assert_eq!(ret, 0);
-        }
+        // A committed readable page followed by a reserved-but-uncommitted (so
+        // inaccessible) page, on both hosts, so a copy can start readable and
+        // fault partway through — and the fault exercises the host's fixup path
+        // (the Linux `SIGSEGV`/`SIGBUS` handler or the Windows VEH).
+        let base = vm::reserve(PAGE * 2).unwrap();
+        vm::commit(base, PAGE, Prot::ReadWrite).unwrap();
+        unsafe { ptr::write_bytes(base, 0xab, PAGE) };
+        let base = base as usize;
 
         let mut buf = [0u8; 64];
         assert_eq!(fetch_copy(base as u64, &mut buf), buf.len());
@@ -152,6 +154,6 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(fetch_copy((base + PAGE) as u64, &mut buf), 0);
 
-        unsafe { libc::munmap(map, PAGE * 2) };
+        vm::release(base as *mut u8, PAGE * 2);
     }
 }

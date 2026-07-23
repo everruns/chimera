@@ -25,7 +25,7 @@ use crate::{
     sys::vm::{self, Prot},
 };
 
-use super::{dispatch::ThreadState, trampoline::fetch_copy};
+use super::{state::ThreadState, trampoline::fetch_copy};
 
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
 /// Longest possible x86-64 instruction encoding. An instruction whose start

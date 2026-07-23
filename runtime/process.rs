@@ -119,7 +119,7 @@ impl Process {
         install_interrupt_handler();
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
         // caught synchronously (see [`crate::sys::linux::fault`]).
-        crate::sys::linux::fault::install();
+        crate::sys::fault::install();
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
             handler,

@@ -2,7 +2,7 @@
 //! handlers, the [`SystemCalls`] trait, the runtime's syscall driver
 //! [`syscall`], and the default [`Passthrough`] handler.
 
-use crate::sys::linux::syscall::host_syscall;
+use crate::sys::host_syscall;
 
 /// A single guest system call, presented to a [`SystemCalls`] handler.
 ///
@@ -110,7 +110,9 @@ pub trait SystemCalls: Send + Sync {
     /// [`Passthrough`] a guest fd already *is* a host fd.
     ///
     /// Only consulted for a file-backed `mmap` (one whose `fd` is not `-1`).
-    fn resolve_fd(&self, _guest_fd: i32) -> Option<std::os::fd::RawFd> {
+    /// The host descriptor is a plain `i32` (a Unix `RawFd`) rather than a
+    /// platform fd type, so the trait stays host-neutral.
+    fn resolve_fd(&self, _guest_fd: i32) -> Option<i32> {
         None
     }
 
@@ -190,8 +192,11 @@ pub enum SyscallResult {
 // `syscall` is the runtime entry the arch dispatcher calls once per guest
 // syscall instruction: it intercepts the calls Chimera must service itself
 // (`exit`/`exit_group`, `execve`/`execveat`, `arch_prctl`, the `mmap` family)
-// and hands the rest to the embedder hooks.
+// and hands the rest to the embedder hooks. It drives the Linux run loop and
+// intercepts Linux syscall numbers, so it lives behind the Linux gate; the
+// Windows guest run loop and its NT-call driver are a separate port.
 
+#[cfg(target_os = "linux")]
 mod host {
     use std::ptr;
 
@@ -909,4 +914,5 @@ mod host {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub use host::syscall;

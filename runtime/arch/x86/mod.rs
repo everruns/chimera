@@ -9,9 +9,16 @@ use std::sync::OnceLock;
 use crate::Error;
 
 pub mod cache;
-pub mod dispatch;
+pub mod state;
 pub mod trampoline;
 pub mod translate;
+
+// The run loop is host-specific (Linux signals, threads, and syscalls). Only
+// the DBT primitives it drives — `state`, `translate`, `cache`, `trampoline` —
+// are host-neutral, so the guest-facing loop stays behind the Linux gate until
+// its Windows counterpart lands.
+#[cfg(target_os = "linux")]
+pub mod dispatch;
 
 pub use translate::mpk_enabled;
 

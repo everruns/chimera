@@ -8,7 +8,7 @@
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use x86::dispatch;
 
 #[cfg(target_arch = "x86_64")]

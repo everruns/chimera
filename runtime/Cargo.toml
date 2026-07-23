@@ -19,6 +19,9 @@ thiserror = "2"
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug"] }
+
 [dev-dependencies]
 argh = "0.1.19"
 mimalloc = "0.1.52"

@@ -41,3 +41,28 @@ jobs:
       - name: conformance
         if: runner.os == 'Linux'
         run: make conformance
+
+  # The Windows guest port is in progress: the host abstraction layer (sys::vm,
+  # the vectored-exception fault handler, the Win64 trampoline) and the DBT
+  # primitives build and unit-test on Windows, while the guest run loop, the
+  # CLI's Linux VFS surface, the examples, and conformance remain Linux-only.
+  # This job guards the parts that do build; widen it as the port fills in.
+  windows:
+    name: windows-latest (runtime)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: build
+        run: cargo build -p chimera-runtime --lib --locked
+
+      - name: test
+        run: cargo test -p chimera-runtime --lib --locked

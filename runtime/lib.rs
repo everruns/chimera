@@ -8,14 +8,18 @@ use std::{
 };
 
 mod arch;
+#[cfg(target_os = "linux")]
 mod process;
 mod sys;
 mod syscall;
 
 pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
-pub use sys::linux::syscall::host_syscall;
+pub use sys::host_syscall;
 
+// The virtual-filesystem and namespace surface is Linux userspace semantics
+// layered on the Linux guest; it has no Windows-guest analogue yet.
+#[cfg(target_os = "linux")]
 pub use sys::linux::{
     DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, Personality,
     RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
