@@ -12,10 +12,11 @@
 //! violation is left for the next handler in the chain — a genuine guest fault,
 //! or one in Chimera's own code.
 //!
-//! Self-modifying-code write recovery, which the Linux handler also does, needs
-//! the running guest's shared process state and arrives with the Windows run
-//! loop; until then this handler only performs the copy fixups, which need no
-//! per-thread state and are recognized purely by instruction-pointer range.
+//! It also recovers self-modifying-code writes, as the Linux handler does: a
+//! guest store from the code cache that faults on an armed (read-only) code page
+//! drops that page's stale translations, restores its write permission, and
+//! re-runs, so the next execution re-translates the modified code. The run loop
+//! publishes the guest address space through [`set_address_space`] for this.
 
 use std::{
     ptr,
