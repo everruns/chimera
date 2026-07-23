@@ -182,17 +182,16 @@ mod tests {
         }
     }
 
-    /// Map a guest code buffer and a stack, run it, and return (exit_code, the
-    /// syscalls the handler observed). The stack top holds a null return address,
-    /// so a top-level `ret` exits.
-    fn run_code(code: &[u8]) -> (i32, Vec<(u64, [u64; 6])>) {
+    /// Map a guest code buffer, a stack, and a synthetic TEB at `teb_base` (0 for
+    /// none), run it, and return the exit code and the syscalls the handler saw.
+    /// The stack top holds a null return address, so a top-level `ret` exits.
+    fn run_with_teb(code: &[u8], teb_base: u64) -> (i32, Vec<(u64, [u64; 6])>) {
         let page = vm::page_size();
         let code_region = vm::map_anon(page, Prot::ReadWrite).unwrap();
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), code_region, code.len()) };
 
         let stack_len = 64 * 1024;
         let stack = vm::map_anon(stack_len, Prot::ReadWrite).unwrap();
-        // rsp points at a null return address at the top of the stack.
         let rsp = stack as u64 + stack_len as u64 - 8;
         unsafe { std::ptr::write(rsp as *mut u64, 0u64) };
 
@@ -204,7 +203,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         });
         let seen_handle = &recorder.seen as *const Mutex<Vec<SystemCall>>;
-        let mut guest = Guest::new(recorder, addr, code_region as u64, rsp, 0);
+        let mut guest = Guest::new(recorder, addr, code_region as u64, rsp, teb_base);
         let exit = guest.run().unwrap();
 
         let seen: Vec<(u64, [u64; 6])> = unsafe { &*seen_handle }
@@ -216,22 +215,21 @@ mod tests {
         (exit, seen)
     }
 
+    fn run_code(code: &[u8]) -> (i32, Vec<(u64, [u64; 6])>) {
+        run_with_teb(code, 0)
+    }
+
     #[test]
     fn runs_a_block_returns_exit_code() {
         // mov eax, 42 ; ret   (ret -> null return address -> clean exit)
-        let code = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
-        let (exit, seen) = run_code(&code);
+        let (exit, seen) = run_code(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
         assert_eq!(exit, 42);
         assert!(seen.is_empty());
     }
 
     #[test]
     fn intercepts_syscall_and_exits() {
-        // mov eax, 0x1234      ; syscall number
-        // mov r10, 7           ; NT arg1
-        // syscall              ; -> handler
-        // mov eax, 99          ; exit code
-        // ret                  ; -> null -> exit
+        // mov eax, 0x1234 ; mov r10, 7 ; syscall ; mov eax, 99 ; ret
         let code = [
             0xB8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
             0x49, 0xC7, 0xC2, 0x07, 0x00, 0x00, 0x00, // mov r10, 7
@@ -244,5 +242,71 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, 0x1234);
         assert_eq!(seen[0].1[0], 7);
+    }
+
+    #[test]
+    fn loop_with_back_edge() {
+        // Sum 10+9+...+1 = 55, closing the loop with a back-edge whose linked
+        // form carries the safepoint poll (jrcxz on the exit flag), so this also
+        // exercises that the poll preserves the guest's rcx loop counter.
+        //   xor eax,eax ; mov ecx,10 ; L: add eax,ecx ; dec ecx ; jnz L ; ret
+        let code = [
+            0x31, 0xC0, // xor eax, eax
+            0xB9, 0x0A, 0x00, 0x00, 0x00, // mov ecx, 10
+            0x01, 0xC8, // add eax, ecx        (loop top @7)
+            0xFF, 0xC9, // dec ecx
+            0x75, 0xFA, // jnz -6 -> @7
+            0xC3, // ret
+        ];
+        assert_eq!(run_code(&code).0, 55);
+    }
+
+    #[test]
+    fn conditional_branch() {
+        // mov eax,5 ; cmp eax,3 ; jg end ; mov eax,0 ; end: ret
+        let code = [
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+            0x83, 0xF8, 0x03, // cmp eax, 3
+            0x7F, 0x05, // jg +5 -> ret
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0 (skipped)
+            0xC3, // ret
+        ];
+        assert_eq!(run_code(&code).0, 5);
+    }
+
+    #[test]
+    fn memory_push_pop() {
+        // push 0x2A ; pop rax ; ret   — a store then load through the guest stack
+        assert_eq!(run_code(&[0x6A, 0x2A, 0x58, 0xC3]).0, 42);
+    }
+
+    #[test]
+    fn fp_roundtrip_uses_xsave_prologue() {
+        // mov eax,3 ; cvtsi2sd xmm0,eax ; cvtsd2si eax,xmm0 ; ret
+        // Touching xmm0 makes the block open with the FP-restore prologue
+        // (xrstor of fpstate through the context segment).
+        let code = [
+            0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xF2, 0x0F, 0x2A, 0xC0, // cvtsi2sd xmm0, eax
+            0xF2, 0x0F, 0x2D, 0xC0, // cvtsd2si eax, xmm0
+            0xC3, // ret
+        ];
+        assert_eq!(run_code(&code).0, 3);
+    }
+
+    #[test]
+    fn guest_gs_segment_is_virtualized() {
+        // The guest reads gs:[0x30] (its TEB self-slot). The block prologue must
+        // install the guest's gs base (wrgsbase of guest_fs_base) so the read hits
+        // the synthetic TEB, and the exit trampoline must restore the runtime's gs
+        // afterward — if it did not, the run loop's own Rust would fault next.
+        //   mov rax, gs:[0x30] ; ret
+        let teb = vm::map_anon(vm::page_size(), Prot::ReadWrite).unwrap();
+        unsafe { std::ptr::write((teb as u64 + 0x30) as *mut u64, 0x77) };
+        let code = [
+            0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, // mov rax, gs:[0x30]
+            0xC3, // ret
+        ];
+        assert_eq!(run_with_teb(&code, teb as u64).0, 0x77);
     }
 }
